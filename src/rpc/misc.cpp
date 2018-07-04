@@ -54,6 +54,7 @@ UniValue getinfo(const UniValue& params, bool fHelp)
             "  \"walletversion\": xxxxx,     (numeric) the wallet version\n"
             "  \"balance\": xxxxxxx,         (numeric) the total navcoin balance of the wallet\n"
             "  \"blocks\": xxxxxx,           (numeric) the current number of blocks processed in the server\n"
+            "  \"ntptimeoffset\": xxxxx,     (numeric) the time offset\n"
             "  \"timeoffset\": xxxxx,        (numeric) the time offset\n"
             "  \"connections\": xxxxx,       (numeric) the number of connections\n"
             "  \"proxy\": \"host:port\",     (string, optional) the proxy used by the server\n"
@@ -99,6 +100,7 @@ UniValue getinfo(const UniValue& params, bool fHelp)
 
     obj.push_back(Pair("communityfund", cf));
     obj.push_back(Pair("timeoffset",    GetTimeOffset()));
+    obj.push_back(Pair("ntptimeoffset", GetNtpTimeOffset()));
     obj.push_back(Pair("connections",   (int)vNodes.size()));
     obj.push_back(Pair("proxy",         (proxy.IsValid() ? proxy.proxy.ToStringIPPort() : string())));
     obj.push_back(Pair("testnet",       Params().TestnetToBeDeprecatedFieldRPC()));
@@ -191,7 +193,6 @@ UniValue validateaddress(const UniValue& params, bool fHelp)
 
     string address_str = params[0].get_str();
 
-#ifdef HAVE_UNBOUND
     utils::DNSResolver *DNS = nullptr;
     bool dnssec_valid;
 
@@ -209,7 +210,6 @@ UniValue validateaddress(const UniValue& params, bool fHelp)
         }
 
     }
-#endif
 
     CNavCoinAddress address(address_str);
     bool isValid = address.IsValid();
@@ -221,10 +221,8 @@ UniValue validateaddress(const UniValue& params, bool fHelp)
         CTxDestination dest = address.Get();
         string currentAddress = address.ToString();
         ret.push_back(Pair("address", currentAddress));
-#ifdef HAVE_UNBOUND
         if(DNS->check_address_syntax(params[0].get_str().c_str()))
             ret.push_back(Pair("dnssec", dnssec_valid));
-#endif
 
         CScript scriptPubKey = GetScriptForDestination(dest);
         ret.push_back(Pair("scriptPubKey", HexStr(scriptPubKey.begin(), scriptPubKey.end())));

@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2017 The NavCoin developers
+// Copyright (c) 2018 The NavCoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -24,6 +24,7 @@
 #include "main.h"
 #include "miner.h"
 #include "net.h"
+#include "ntpclient.h"
 #include "policy/policy.h"
 #include "rpc/server.h"
 #include "rpc/register.h"
@@ -35,7 +36,9 @@
 #include "txmempool.h"
 #include "torcontrol.h"
 #include "ui_interface.h"
+#include "untar.h"
 #include "util.h"
+#include "utiltime.h"
 #include "utilmoneystr.h"
 #include "validationinterface.h"
 #ifdef ENABLE_WALLET
@@ -57,6 +60,7 @@
 #include <boost/function.hpp>
 #include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/thread.hpp>
+#include <curl/curl.h>
 #include <openssl/crypto.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
@@ -101,6 +105,34 @@ enum BindFlags {
 };
 
 static const char* FEE_ESTIMATES_FILENAME="fee_estimates.dat";
+
+static float fBootstrapProgress = 0.0;
+
+static int xferinfo(void *p,
+                    curl_off_t dltotal, curl_off_t dlnow,
+                    curl_off_t ultotal, curl_off_t ulnow)
+{
+    float fProgress = (float)dlnow/(float)dltotal*100.0f;
+    if (fProgress == fBootstrapProgress)
+        return 0;
+
+    uiInterface.InitMessage(strprintf("[BOOTSTRAP] Downloaded %" CURL_FORMAT_CURL_OFF_T "MB of %" CURL_FORMAT_CURL_OFF_T
+                                      "MB  (%.2f%%)",
+                                      dlnow/(1024*1024), dltotal/(1024*1024), (float)dlnow/(float)dltotal*100.0f));
+    fprintf(stdout, "[BOOTSTRAP] Downloaded %" CURL_FORMAT_CURL_OFF_T "MB of %" CURL_FORMAT_CURL_OFF_T
+            "MB  (%.2f%%)    \r",
+            dlnow/(1024*1024), dltotal/(1024*1024), fProgress);
+
+    fBootstrapProgress = fProgress;
+
+    return 0;
+}
+
+size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    size_t written;
+    written = fwrite(ptr, size, nmemb, stream);
+    return written;
+}
 
 //////////////////////////////////////////////////////////////////////////////
 //
@@ -302,7 +334,7 @@ void OnRPCPreCommand(const CRPCCommand& cmd)
     // Observe safe mode
     string strWarning = GetWarnings("rpc");
     if (strWarning != "" && !GetBoolArg("-disablesafemode", DEFAULT_DISABLE_SAFEMODE) &&
-        !cmd.okSafeMode)
+            !cmd.okSafeMode)
         throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE, string("Safe mode: ") + strWarning);
 }
 
@@ -319,6 +351,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-blocknotify=<cmd>", _("Execute command when the best block changes (%s in cmd is replaced by block hash)"));
     if (showDebug)
         strUsage += HelpMessageOpt("-blocksonly", strprintf(_("Whether to operate in a blocks only mode (default: %u)"), DEFAULT_BLOCKSONLY));
+    strUsage += HelpMessageOpt("-bootstrap=<url>", _("Specifies an URL from where a bootstrapped copy of the blockchain would be downloaded"));
     strUsage += HelpMessageOpt("-checkblocks=<n>", strprintf(_("How many blocks to check at startup (default: %u, 0 = all)"), DEFAULT_CHECKBLOCKS));
     strUsage += HelpMessageOpt("-checklevel=<n>", strprintf(_("How thorough the block verification of -checkblocks is (0-4, default: %u)"), DEFAULT_CHECKLEVEL));
     strUsage += HelpMessageOpt("-conf=<file>", strprintf(_("Specify configuration file (default: %s)"), NAVCOIN_CONF_FILENAME));
@@ -336,16 +369,20 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-maxorphantx=<n>", strprintf(_("Keep at most <n> unconnectable transactions in memory (default: %u)"), DEFAULT_MAX_ORPHAN_TRANSACTIONS));
     strUsage += HelpMessageOpt("-maxmempool=<n>", strprintf(_("Keep the transaction memory pool below <n> megabytes (default: %u)"), DEFAULT_MAX_MEMPOOL_SIZE));
     strUsage += HelpMessageOpt("-mempoolexpiry=<n>", strprintf(_("Do not keep transactions in the mempool longer than <n> hours (default: %u)"), DEFAULT_MEMPOOL_EXPIRY));
+    strUsage += HelpMessageOpt("-minersleep=<n>", strprintf(_("Sets the default sleep for the staking thread (default: %u)"), 500));
     strUsage += HelpMessageOpt("-par=<n>", strprintf(_("Set the number of script verification threads (%u to %d, 0 = auto, <0 = leave that many cores free, default: %d)"),
-        -GetNumCores(), MAX_SCRIPTCHECK_THREADS, DEFAULT_SCRIPTCHECK_THREADS));
+                                                     -GetNumCores(), MAX_SCRIPTCHECK_THREADS, DEFAULT_SCRIPTCHECK_THREADS));
 #ifndef WIN32
     strUsage += HelpMessageOpt("-pid=<file>", strprintf(_("Specify pid file (default: %s)"), NAVCOIN_PID_FILENAME));
 #endif
     strUsage += HelpMessageOpt("-prune=<n>", strprintf(_("Reduce storage requirements by pruning (deleting) old blocks. This mode is incompatible with -txindex and -rescan. "
-            "Warning: Reverting this setting requires re-downloading the entire blockchain. "
-            "(default: 0 = disable pruning blocks, >%u = target size in MiB to use for block files)"), MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024));
+                                                         "Warning: Reverting this setting requires re-downloading the entire blockchain. "
+                                                         "(default: 0 = disable pruning blocks, >%u = target size in MiB to use for block files)"), MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024));
     strUsage += HelpMessageOpt("-reindex-chainstate", _("Rebuild chain state from the currently indexed blocks"));
     strUsage += HelpMessageOpt("-reindex", _("Rebuild chain state and block index from the blk*.dat files on disk"));
+#ifdef ENABLE_WALLET
+    strUsage += HelpMessageOpt("-staking=<bool>", _("Enables or disables the staking thread."));
+#endif
 #ifndef WIN32
     strUsage += HelpMessageOpt("-sysperms", _("Create new files with system default permissions, instead of umask 077 (only effective with disabled wallet functionality)"));
 #endif
@@ -354,13 +391,19 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-addressindex", strprintf(_("Maintain a full address index, used to query for the balance, txids and unspent outputs for addresses (default: %u)"), DEFAULT_ADDRESSINDEX));
     strUsage += HelpMessageOpt("-timestampindex", strprintf(_("Maintain a timestamp index for block hashes, used to query blocks hashes by a range of timestamps (default: %u)"), DEFAULT_TIMESTAMPINDEX));
     strUsage += HelpMessageOpt("-spentindex", strprintf(_("Maintain a full spent index, used to query the spending txid and input index for an outpoint (default: %u)"), DEFAULT_SPENTINDEX));
-
+    strUsage += HelpMessageGroup(_("Clock options:"));
+    strUsage += HelpMessageOpt("-ntpserver=<ip/host>", _("Adds a ntp server to use for clock syncronization"));
+    strUsage += HelpMessageOpt("-ntpminmeasures=<n>", strprintf(_("Min. number of valid requests to NTP servers (default: %u)"), MINIMUM_NTP_MEASURE));
+    strUsage += HelpMessageOpt("-ntptimeout=<n>", strprintf(_("Number of seconds to wait for a response from a NTP server (default: %u)"), DEFAULT_NTP_TIMEOUT));
+    strUsage += HelpMessageOpt("-maxtimeoffset=<n>", strprintf(_("Max number of seconds allowed as clock offset for a peer (default: %u)"), MAXIMUM_TIME_OFFSET));
     strUsage += HelpMessageGroup(_("Connection options:"));
     strUsage += HelpMessageOpt("-addnode=<ip>", _("Add a node to connect to and attempt to keep the connection open"));
+    strUsage += HelpMessageOpt("-addanonserver=<ip>", _("Add a NavTech node to use for private transactions"));
     strUsage += HelpMessageOpt("-banscore=<n>", strprintf(_("Threshold for disconnecting misbehaving peers (default: %u)"), DEFAULT_BANSCORE_THRESHOLD));
     strUsage += HelpMessageOpt("-bantime=<n>", strprintf(_("Number of seconds to keep misbehaving peers from reconnecting (default: %u)"), DEFAULT_MISBEHAVING_BANTIME));
     strUsage += HelpMessageOpt("-bind=<addr>", _("Bind to given address and always listen on it. Use [host]:port notation for IPv6"));
     strUsage += HelpMessageOpt("-connect=<ip>", _("Connect only to the specified node(s)"));
+    strUsage += HelpMessageOpt("-devnet", _("Uses the devnet network"));
     strUsage += HelpMessageOpt("-discover", _("Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)"));
     strUsage += HelpMessageOpt("-dns", _("Allow DNS lookups for -addnode, -seednode and -connect") + " " + strprintf(_("(default: %u)"), DEFAULT_NAME_LOOKUP));
     strUsage += HelpMessageOpt("-dnsseed", _("Query for peer addresses via DNS lookup, if low on addresses (default: 1 unless -connect)"));
@@ -376,10 +419,14 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-onlynet=<net>", _("Only connect to nodes in network <net> (ipv4, ipv6 or onion)"));
     strUsage += HelpMessageOpt("-permitbaremultisig", strprintf(_("Relay non-P2SH multisig (default: %u)"), DEFAULT_PERMIT_BAREMULTISIG));
     strUsage += HelpMessageOpt("-peerbloomfilters", strprintf(_("Support filtering of blocks and transaction with bloom filters (default: %u)"), DEFAULT_PEERBLOOMFILTERS));
-    strUsage += HelpMessageOpt("-port=<port>", strprintf(_("Listen for connections on <port> (default: %u or testnet: %u)"), Params(CBaseChainParams::MAIN).GetDefaultPort(), Params(CBaseChainParams::TESTNET).GetDefaultPort()));
+    strUsage += HelpMessageOpt("-port=<port>", strprintf(_("Listen for connections on <port> (default: %u or testnet: %u or devnet: %u)"), Params(CBaseChainParams::MAIN).GetDefaultPort(), Params(CBaseChainParams::TESTNET).GetDefaultPort(), Params(CBaseChainParams::DEVNET).GetDefaultPort()));
     strUsage += HelpMessageOpt("-proxy=<ip:port>", _("Connect through SOCKS5 proxy"));
     strUsage += HelpMessageOpt("-proxyrandomize", strprintf(_("Randomize credentials for every proxy connection. This enables Tor stream isolation (default: %u)"), DEFAULT_PROXYRANDOMIZE));
+    strUsage += HelpMessageOpt("-requirednssec", _("Requires DNS Sec for OpenAlias requests (default: true)"));
     strUsage += HelpMessageOpt("-seednode=<ip>", _("Connect to a node to retrieve peer addresses, and disconnect"));
+#ifdef ENABLE_WALLET
+    strUsage += HelpMessageOpt("-stakervote=<string>", _("Defines the staker vote to be attached to found blocks."));
+#endif
     strUsage += HelpMessageOpt("-timeout=<n>", strprintf(_("Specify connection timeout in milliseconds (minimum: 1, default: %d)"), DEFAULT_CONNECT_TIMEOUT));
     strUsage += HelpMessageOpt("-torcontrol=<ip>:<port>", strprintf(_("Tor control port to use if onion listening enabled (default: %s)"), DEFAULT_TOR_CONTROL));
     strUsage += HelpMessageOpt("-torpassword=<pass>", _("Tor control port password (default: empty)"));
@@ -392,7 +439,7 @@ std::string HelpMessage(HelpMessageMode mode)
 #endif
     strUsage += HelpMessageOpt("-whitebind=<addr>", _("Bind to given address and whitelist peers connecting to it. Use [host]:port notation for IPv6"));
     strUsage += HelpMessageOpt("-whitelist=<netmask>", _("Whitelist peers connecting from the given netmask or IP address. Can be specified multiple times.") +
-        " " + _("Whitelisted peers cannot be DoS banned and their transactions are always relayed, even if they are already in the mempool, useful e.g. for a gateway"));
+                               " " + _("Whitelisted peers cannot be DoS banned and their transactions are always relayed, even if they are already in the mempool, useful e.g. for a gateway"));
     strUsage += HelpMessageOpt("-whitelistrelay", strprintf(_("Accept relayed transactions received from whitelisted peers even when not relaying transactions (default: %d)"), DEFAULT_WHITELISTRELAY));
     strUsage += HelpMessageOpt("-whitelistforcerelay", strprintf(_("Force relay of transactions from whitelisted peers even they violate local relay policy (default: %d)"), DEFAULT_WHITELISTFORCERELAY));
     strUsage += HelpMessageOpt("-maxuploadtarget=<n>", strprintf(_("Tries to keep outbound traffic under the given target (in MiB per 24h), 0 = no limit (default: %d)"), DEFAULT_MAX_UPLOAD_TARGET));
@@ -430,7 +477,7 @@ std::string HelpMessage(HelpMessageMode mode)
     if (mode == HMM_NAVCOIN_QT)
         debugCategories += ", qt";
     strUsage += HelpMessageOpt("-debug=<category>", strprintf(_("Output debugging information (default: %u, supplying <category> is optional)"), 0) + ". " +
-        _("If <category> is not supplied or if <category> = 1, output all debugging information.") + _("<category> can be:") + " " + debugCategories + ".");
+                               _("If <category> is not supplied or if <category> = 1, output all debugging information.") + _("<category> can be:") + " " + debugCategories + ".");
     if (showDebug)
         strUsage += HelpMessageOpt("-nodebug", "Turn off debugging messages, same as -debug=0");
     strUsage += HelpMessageOpt("-help-debug", _("Show all debugging options (usage: --help -help-debug)"));
@@ -446,9 +493,9 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-maxtipage=<n>", strprintf("Maximum tip age in seconds to consider node in initial block download (default: %u)", DEFAULT_MAX_TIP_AGE));
     }
     strUsage += HelpMessageOpt("-minrelaytxfee=<amt>", strprintf(_("Fees (in %s/kB) smaller than this are considered zero fee for relaying, mining and transaction creation"),
-        CURRENCY_UNIT));
+                                                                 CURRENCY_UNIT));
     strUsage += HelpMessageOpt("-maxtxfee=<amt>", strprintf(_("Maximum total fees (in %s) to use in a single wallet transaction or raw transaction; setting this too low may abort large transactions"),
-        CURRENCY_UNIT));
+                                                            CURRENCY_UNIT));
     strUsage += HelpMessageOpt("-printtoconsole", _("Send trace/debug info to console instead of debug.log file"));
     if (showDebug)
     {
@@ -481,9 +528,12 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-rpcuser=<user>", _("Username for JSON-RPC connections"));
     strUsage += HelpMessageOpt("-rpcpassword=<pw>", _("Password for JSON-RPC connections"));
     strUsage += HelpMessageOpt("-rpcauth=<userpw>", _("Username and hashed password for JSON-RPC connections. The field <userpw> comes in the format: <USERNAME>:<SALT>$<HASH>. A canonical python script is included in share/rpcuser. This option can be specified multiple times"));
-    strUsage += HelpMessageOpt("-rpcport=<port>", strprintf(_("Listen for JSON-RPC connections on <port> (default: %u or testnet: %u)"), BaseParams(CBaseChainParams::MAIN).RPCPort(), BaseParams(CBaseChainParams::TESTNET).RPCPort()));
+    strUsage += HelpMessageOpt("-rpcport=<port>", strprintf(_("Listen for JSON-RPC connections on <port> (default: %u or testnet: %u or devnet: %u)"), BaseParams(CBaseChainParams::MAIN).RPCPort(), BaseParams(CBaseChainParams::TESTNET).RPCPort(), BaseParams(CBaseChainParams::DEVNET).RPCPort()));
     strUsage += HelpMessageOpt("-rpcallowip=<ip>", _("Allow JSON-RPC connections from specified source. Valid for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24). This option can be specified multiple times"));
     strUsage += HelpMessageOpt("-rpcthreads=<n>", strprintf(_("Set the number of threads to service RPC calls (default: %d)"), DEFAULT_HTTP_THREADS));
+    strUsage += HelpMessageGroup(_("GUI options:"));
+    strUsage += HelpMessageOpt("-updatefiatperiod=<miliseconds>", _("Sets the interval in miliseconds to update the fiat price from CoinMarketcap. Min. 120000"));
+
     if (showDebug) {
         strUsage += HelpMessageOpt("-rpcworkqueue=<n>", strprintf("Set the depth of the work queue to service RPC calls (default: %d)", DEFAULT_HTTP_WORKQUEUE));
         strUsage += HelpMessageOpt("-rpcservertimeout=<n>", strprintf("Timeout during HTTP requests (default: %d)", DEFAULT_HTTP_SERVER_TIMEOUT));
@@ -498,20 +548,48 @@ std::string LicenseInfo()
     const std::string URL_WEBSITE = "<https://navcoin.org>";
     // todo: remove urls from translations on next change
     return CopyrightHolders(strprintf(_("Copyright (C) %i-%i"), 2009, COPYRIGHT_YEAR) + " ") + "\n" +
-           "\n" +
-           strprintf(_("Please contribute if you find %s useful. "
-                       "Visit %s for further information about the software."),
-               PACKAGE_NAME, URL_WEBSITE) +
-           "\n" +
-           strprintf(_("The source code is available from %s."),
-               URL_SOURCE_CODE) +
-           "\n" +
-           "\n" +
-           _("This is experimental software.") + "\n" +
-           _("Distributed under the MIT software license, see the accompanying file COPYING or <http://www.opensource.org/licenses/mit-license.php>.") + "\n" +
-           "\n" +
-           _("This product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit <https://www.openssl.org/> and cryptographic software written by Eric Young and UPnP software written by Thomas Bernard.") +
-           "\n";
+            "\n" +
+            strprintf(_("Please contribute if you find %s useful. "
+                        "Visit %s for further information about the software."),
+                      PACKAGE_NAME, URL_WEBSITE) +
+            "\n" +
+            strprintf(_("The source code is available from %s."),
+                      URL_SOURCE_CODE) +
+            "\n" +
+            "\n" +
+            _("This is experimental software.") + "\n" +
+            _("Distributed under the MIT software license, see the accompanying file COPYING or <http://www.opensource.org/licenses/mit-license.php>.") + "\n" +
+            "\n" +
+            _("This product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit <https://www.openssl.org/> and cryptographic software written by Eric Young and UPnP software written by Thomas Bernard.") +
+            "\n" +
+            _("Copyright (c) 2014-2017, The Monero Project") + "\n" +
+            "\n" +
+            _("All rights reserved.") + "\n" +
+            "\n" +
+            _("Redistribution and use in source and binary forms, with or without modification, are") + "\n" +
+            _("permitted provided that the following conditions are met:") + "\n" +
+            "\n" +
+            _("1. Redistributions of source code must retain the above copyright notice, this list of") + "\n" +
+            _("   conditions and the following disclaimer.") + "\n" +
+            "\n" +
+            _("2. Redistributions in binary form must reproduce the above copyright notice, this list") + "\n" +
+            _("   of conditions and the following disclaimer in the documentation and/or other") + "\n" +
+            _("   materials provided with the distribution.") + "\n" +
+            "\n" +
+            _("3. Neither the name of the copyright holder nor the names of its contributors may be") + "\n" +
+            _("   used to endorse or promote products derived from this software without specific") + "\n" +
+            _("   prior written permission.") + "\n" +
+            "\n" +
+            _("THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND ANY") + "\n" +
+            _(" EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF") + "\n" +
+            _(" MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL") + "\n" +
+            _(" THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,") + "\n" +
+            _(" SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,") + "\n" +
+            _(" PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS") + "\n" +
+            _(" INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,") + "\n" +
+            _(" STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF") + "\n" +
+            _(" THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.") + "\n" +
+            "\n";
 }
 
 static void BlockNotifyCallback(bool initialSync, const CBlockIndex *pBlockIndex)
@@ -557,8 +635,8 @@ void CleanupBlockRevFiles()
     path blocksdir = GetDataDir() / "blocks";
     for (directory_iterator it(blocksdir); it != directory_iterator(); it++) {
         if (is_regular_file(*it) &&
-            it->path().filename().string().length() == 12 &&
-            it->path().filename().string().substr(8,4) == ".dat")
+                it->path().filename().string().length() == 12 &&
+                it->path().filename().string().substr(8,4) == ".dat")
         {
             if (it->path().filename().string().substr(0,3) == "blk")
                 mapBlockFiles[it->path().filename().string().substr(3,5)] = it->path();
@@ -775,11 +853,119 @@ void InitLogging()
     LogPrintf("NavCoin version %s\n", FormatFullVersion());
 }
 
+void DownloadBlockchain(std::string url)
+{
+
+    CURL *curl;
+    FILE *fp, *a;
+    CURLcode res;
+
+    curl = curl_easy_init();
+    if (curl)
+    {
+
+        std::string sDownload = (GetDataDir(false).string() + "/bootstrap_temp.tar");
+        fp = fopen(sDownload.c_str(),"wb");
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        res = curl_easy_perform(curl);
+
+        if (res != CURLE_OK)
+        {
+            curl_easy_cleanup(curl);
+            curl_global_cleanup();
+            throw std::runtime_error("Failed!");
+
+        }
+        else
+        {
+
+            curl_easy_cleanup(curl);
+            curl_global_cleanup();
+            int i=fclose(fp);
+
+            if(i==0)
+            {
+
+                a = fopen(sDownload.c_str(), "rb");
+
+                if (a == NULL)
+                {
+
+                    boost::filesystem::remove_all(sDownload);
+                    throw std::runtime_error("Unable to open downloaded file.");
+
+                }
+                else
+                {
+
+                    boost::filesystem::remove_all(GetDataDir(false) / "blocks");
+                    boost::filesystem::remove_all(GetDataDir(false) / "chainstate");
+                    boost::filesystem::remove_all(GetDataDir(false) / "cfund");
+                    bool fOk = untar(a, sDownload.c_str());
+                    fclose(a);
+                    boost::filesystem::remove_all(sDownload);
+
+                    if(!fOk)
+                        throw std::runtime_error("Could not extract data.");
+
+                }
+
+            }
+            else
+            {
+
+                throw std::runtime_error("Failed!");
+
+            }
+
+        }
+
+    }
+    else
+    {
+
+        throw std::runtime_error("Failed!");
+
+    }
+}
+
 /** Initialize navcoin.
  *  @pre Parameters should be parsed and config file should be read.
  */
 bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 {
+    // ********************************************************* Step 0: download bootstrap
+    std::string sBootstrap = GetArg("-bootstrap","");
+
+    if(sBootstrap != "")
+    {
+
+        RemoveConfigFile("bootstrap");
+        uiInterface.InitMessage(strprintf("Trying to download from %s", sBootstrap.c_str()));
+
+        try
+        {
+
+            DownloadBlockchain(sBootstrap);
+
+        }
+        catch(const std::exception& e)
+        {
+
+            return InitError(strprintf("[BOOTSTRAP] %s", e.what()));
+
+        }
+
+        uiInterface.InitMessage("Downloaded");
+
+    }
+
     // ********************************************************* Step 1: setup
 #ifdef _MSC_VER
     // Turn off Microsoft heap dump noise
@@ -1090,6 +1276,58 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 #endif // ENABLE_WALLET
     // ********************************************************* Step 6: network initialization
 
+    uiInterface.InitMessage(_("Synchronizing clock..."));
+
+    string sMsg = "";
+    int nWarningCounter = 0;
+
+    if(GetArg("-ntpminmeasures", MINIMUM_NTP_MEASURE) == 0)
+    {
+        sMsg = "You have set to ignore NTP Sync with the wallet "
+               "setting ntpminmeasures=0. Please be aware that "
+               "your system clock needs to be correct in order "
+               "to synchronize with the network. ";
+    } else {
+        while(1)
+        {
+            if(!NtpClockSync())
+            {
+                sMsg = "A connection could not be made to any ntp server. "
+                       "Please ensure you system clock is correct otherwise "
+                       "your stakes will be rejected by the network";
+
+                if (nWarningCounter == 0)
+                {
+                    uiInterface.ThreadSafeMessageBox(sMsg, "", CClientUIInterface::MSG_ERROR);
+                }
+
+                strMiscWarning = sMsg;
+                AlertNotify(strMiscWarning);
+                LogPrintf(strMiscWarning.c_str());
+
+                uiInterface.InitMessage(_(strprintf("Synchronizing clock attempt %i...", nWarningCounter+1).c_str()));
+
+                nWarningCounter++;
+
+                MilliSleep(30000);
+            }
+            else
+            {
+                strMiscWarning = "";
+                sMsg = "";
+                break;
+            }
+        }
+    }
+
+    if (sMsg != "")
+    {
+        uiInterface.ThreadSafeMessageBox(sMsg, "", CClientUIInterface::MSG_ERROR);
+        strMiscWarning = sMsg;
+        AlertNotify(strMiscWarning);
+        LogPrintf(strMiscWarning.c_str());
+    }
+
     RegisterNodeSignals(GetNodeSignals());
 
     // sanitize comments per BIP-0014, format user agent and check total size
@@ -1103,7 +1341,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     strSubVersion = FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, uacomments);
     if (strSubVersion.size() > MAX_SUBVERSION_LENGTH) {
         return InitError(strprintf(_("Total length of network version string (%i) exceeds maximum length (%i). Reduce the number or size of uacomments."),
-            strSubVersion.size(), MAX_SUBVERSION_LENGTH));
+                                   strSubVersion.size(), MAX_SUBVERSION_LENGTH));
     }
 
     if (mapArgs.count("-onlynet")) {
@@ -1208,7 +1446,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
 
     BOOST_FOREACH(const std::string& strDest, mapMultiArgs["-seednode"])
-        AddOneShot(strDest);
+            AddOneShot(strDest);
 
 #if ENABLE_ZMQ
     pzmqNotificationInterface = CZMQNotificationInterface::CreateWithArguments(mapArgs);
@@ -1375,7 +1613,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
                 uiInterface.InitMessage(_("Verifying blocks..."));
                 if (fHavePruned && GetArg("-checkblocks", DEFAULT_CHECKBLOCKS) > MIN_BLOCKS_TO_KEEP) {
                     LogPrintf("Prune: pruned datadir may not have more than %d blocks; only checking available blocks",
-                        MIN_BLOCKS_TO_KEEP);
+                              MIN_BLOCKS_TO_KEEP);
                 }
 
                 {
@@ -1383,8 +1621,8 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
                     CBlockIndex* tip = chainActive.Tip();
                     if (tip && tip->nTime > GetAdjustedTime() + 2 * 60 * 60) {
                         strLoadError = _("The block database contains a block which appears to be from the future. "
-                                "This may be due to your computer's date and time being set incorrectly. "
-                                "Only rebuild the block database if you are sure that your computer's date and time are correct");
+                                         "This may be due to your computer's date and time being set incorrectly. "
+                                         "Only rebuild the block database if you are sure that your computer's date and time are correct");
                         break;
                     }
                     int nTipHeight = 0;
@@ -1394,13 +1632,13 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
                         nTipHeight = tip->nHeight;
                     if(nTipHeight > 0 && nTipHeight != pcfundindex->ReadTipHeight() && fCFEnabled) {
                         strLoadError = _("The community fund database looks to be corrupted. "
-                                "You will need to rebuild the block database.");
+                                         "You will need to rebuild the block database.");
                         break;
                     }
                 }
 
                 if (!CVerifyDB().VerifyDB(chainparams, pcoinsdbview, GetArg("-checklevel", DEFAULT_CHECKLEVEL),
-                              GetArg("-checkblocks", DEFAULT_CHECKBLOCKS))) {
+                                          GetArg("-checkblocks", DEFAULT_CHECKBLOCKS))) {
                     strLoadError = _("Corrupted block database detected");
                     break;
                 }
@@ -1417,9 +1655,9 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
             // first suggest a reindex
             if (!fReset) {
                 bool fRet = uiInterface.ThreadSafeQuestion(
-                    strLoadError + ".\n\n" + _("Do you want to rebuild the block database now?"),
-                    strLoadError + ".\nPlease restart with -reindex or -reindex-chainstate to recover.",
-                    "", CClientUIInterface::MSG_ERROR | CClientUIInterface::BTN_ABORT);
+                            strLoadError + ".\n\n" + _("Do you want to rebuild the block database now?"),
+                            strLoadError + ".\nPlease restart with -reindex or -reindex-chainstate to recover.",
+                            "", CClientUIInterface::MSG_ERROR | CClientUIInterface::BTN_ABORT);
                 if (fRet) {
                     fReindex = true;
                     fRequestShutdown = false;
@@ -1498,7 +1736,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     if (mapArgs.count("-loadblock"))
     {
         BOOST_FOREACH(const std::string& strFile, mapMultiArgs["-loadblock"])
-            vImportFiles.push_back(strFile);
+                vImportFiles.push_back(strFile);
     }
     threadGroup.create_thread(boost::bind(&ThreadImport, vImportFiles));
 
@@ -1560,4 +1798,21 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 #endif
 
     return !fRequestShutdown;
+}
+
+void AlertNotify(const std::string& strMessage)
+{
+    uiInterface.NotifyAlertChanged();
+    std::string strCmd = GetArg("-alertnotify", "");
+    if (strCmd.empty()) return;
+
+    // Alert text should be plain ascii coming from a trusted source, but to
+    // be safe we first strip anything not in safeChars, then add single quotes around
+    // the whole string before passing it to the shell:
+    std::string singleQuote("'");
+    std::string safeStatus = SanitizeString(strMessage);
+    safeStatus = singleQuote+safeStatus+singleQuote;
+    boost::replace_all(strCmd, "%s", safeStatus);
+
+    boost::thread t(runCommand, strCmd); // thread runs free
 }

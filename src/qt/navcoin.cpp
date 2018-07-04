@@ -608,7 +608,7 @@ int main(int argc, char *argv[])
     } catch (const std::exception& e) {
         QMessageBox::critical(0, QObject::tr(PACKAGE_NAME),
                               QObject::tr("Error: Cannot parse configuration file: %1. Only use key=value syntax.").arg(e.what()));
-        return false;
+        return 1;
     }
 
     if(GetArg("-firstrun","0") == "1")
@@ -623,7 +623,7 @@ int main(int argc, char *argv[])
     // - QSettings() will use the new application name after this, resulting in network-specific settings
     // - Needs to be done before createOptionsModel
 
-    // Check for -testnet or -regtest parameter (Params() calls are only valid after this clause)
+    // Check for -testnet or -regtest or -devnet parameter (Params() calls are only valid after this clause)
     try {
         SelectParams(ChainNameFromCommandLine());
     } catch(std::exception &e) {

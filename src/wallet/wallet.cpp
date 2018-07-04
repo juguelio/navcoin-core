@@ -6,7 +6,6 @@
 #include "wallet/wallet.h"
 
 #include "base58.h"
-#include "bignum.h"
 #include "checkpoints.h"
 #include "chain.h"
 #include "coincontrol.h"
@@ -315,7 +314,7 @@ bool CWallet::SelectCoinsForStaking(int64_t nTargetValue, unsigned int nSpendTim
 bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int64_t nSearchInterval, int64_t nFees, CMutableTransaction& txNew, CKey& key)
 {
     CBlockIndex* pindexPrev = pindexBestHeader;
-    CBigNum bnTargetPerCoinDay;
+    arith_uint256 bnTargetPerCoinDay;
     bnTargetPerCoinDay.SetCompact(nBits);
 
     txNew.vin.clear();
@@ -533,7 +532,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
     }
 
     // Adds Community Fund output if enabled
-    if(IsCommunityFundEnabled(pindexPrev, Params().GetConsensus()))
+    if(IsCommunityFundAccumulationEnabled(pindexPrev, Params().GetConsensus(), false))
     {
         int fundIndex = txNew.vout.size() + 1;
         txNew.vout.resize(fundIndex);

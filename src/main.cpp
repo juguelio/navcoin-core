@@ -9,7 +9,6 @@
 #include "addrman.h"
 #include "arith_uint256.h"
 #include "base58.h"
-#include "bignum.h"
 #include "blockencodings.h"
 #include "chainparams.h"
 #include "checkpoints.h"
@@ -31,6 +30,7 @@
 #include "script/sigcache.h"
 #include "script/standard.h"
 #include "tinyformat.h"
+#include "timedata.h"
 #include "txdb.h"
 #include "txmempool.h"
 #include "ui_interface.h"
@@ -1861,23 +1861,6 @@ bool fLargeWorkForkFound = false;
 bool fLargeWorkInvalidChainFound = false;
 CBlockIndex *pindexBestForkTip = NULL, *pindexBestForkBase = NULL;
 
-static void AlertNotify(const std::string& strMessage)
-{
-    uiInterface.NotifyAlertChanged();
-    std::string strCmd = GetArg("-alertnotify", "");
-    if (strCmd.empty()) return;
-
-    // Alert text should be plain ascii coming from a trusted source, but to
-    // be safe we first strip anything not in safeChars, then add single quotes around
-    // the whole string before passing it to the shell:
-    std::string singleQuote("'");
-    std::string safeStatus = SanitizeString(strMessage);
-    safeStatus = singleQuote+safeStatus+singleQuote;
-    boost::replace_all(strCmd, "%s", safeStatus);
-
-    boost::thread t(runCommand, strCmd); // thread runs free
-}
-
 void CheckForkWarningConditions()
 {
     AssertLockHeld(cs_main);
@@ -2518,6 +2501,15 @@ int32_t ComputeBlockVersion(const CBlockIndex* pindexPrev, const Consensus::Para
     if(IsWitnessEnabled(pindexPrev,Params().GetConsensus()))
         nVersion |= nSegWitVersionMask;
 
+    if(IsNtpSyncEnabled(pindexPrev,Params().GetConsensus()))
+        nVersion |= nNSyncVersionMask;
+
+    if(IsCommunityFundEnabled(pindexPrev,Params().GetConsensus()))
+        nVersion |= nCFundVersionMask;
+
+    if(IsCommunityFundAccumulationEnabled(pindexPrev,Params().GetConsensus(), true))
+        nVersion |= nCFundAccVersionMask;
+
     return nVersion;
 }
 
@@ -2893,7 +2885,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
               nStakeReward = tx.GetValueOut() - view.GetValueIn(tx);
               pindex->strDZeel = tx.strDZeel;
 
-              if(IsCommunityFundEnabled(pindex->pprev, Params().GetConsensus()))
+              if(IsCommunityFundAccumulationEnabled(pindex->pprev, Params().GetConsensus(), false))
               {
 
                 if(!tx.vout[tx.vout.size() - 1].IsCommunityFundContribution())
@@ -4319,6 +4311,19 @@ bool IsCommunityFundEnabled(const CBlockIndex* pindexPrev, const Consensus::Para
     return (VersionBitsState(pindexPrev, params, Consensus::DEPLOYMENT_COMMUNITYFUND, versionbitscache) == THRESHOLD_ACTIVE);
 }
 
+bool IsCommunityFundAccumulationEnabled(const CBlockIndex* pindexPrev, const Consensus::Params& params, bool fStrict)
+{
+    LOCK(cs_main);
+    return (IsCommunityFundEnabled(pindexPrev, params) && !fStrict) ||
+          (VersionBitsState(pindexPrev, params, Consensus::DEPLOYMENT_COMMUNITYFUND_ACCUMULATION, versionbitscache) == THRESHOLD_ACTIVE);
+}
+
+bool IsNtpSyncEnabled(const CBlockIndex* pindexPrev, const Consensus::Params& params)
+{
+    LOCK(cs_main);
+    return (VersionBitsState(pindexPrev, params, Consensus::DEPLOYMENT_NTPSYNC, versionbitscache) == THRESHOLD_ACTIVE);
+}
+
 bool IsCommunityFundLocked(const CBlockIndex* pindexPrev, const Consensus::Params& params)
 {
     LOCK(cs_main);
@@ -4388,7 +4393,7 @@ bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& sta
 {
 
     // Check timestamp
-    if (block.GetBlockTime() > nAdjustedTime + 2 * 60 * 60)
+    if (block.GetBlockTime() > nAdjustedTime + (IsNtpSyncEnabled(pindexPrev,Params().GetConsensus()) ? 60 : 2 * 60 * 60))
         return state.Invalid(false, REJECT_INVALID, "time-too-new", "block timestamp too far in the future");
 
     // Reject outdated version blocks when 95% (75% on testnet) of the network has upgraded:
@@ -4409,6 +4414,14 @@ bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& sta
         return state.Invalid(false, REJECT_OBSOLETE, strprintf("bad-version(0x%08x)", block.nVersion),
                            "rejected no cfund block");
 
+    if((block.nVersion & nCFundAccVersionMask) != nCFundAccVersionMask && IsCommunityFundAccumulationEnabled(pindexPrev,Params().GetConsensus(), true))
+        return state.Invalid(false, REJECT_OBSOLETE, strprintf("bad-version(0x%08x)", block.nVersion),
+                           "rejected no cfund accumulation block");
+
+    if((block.nVersion & nNSyncVersionMask) != nNSyncVersionMask && IsNtpSyncEnabled(pindexPrev,Params().GetConsensus()))
+        return state.Invalid(false, REJECT_OBSOLETE, strprintf("bad-version(0x%08x)", block.nVersion),
+                           "rejected no nsync block");
+
     return true;
 }
 
@@ -4425,6 +4438,9 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
 
     if (block.IsProofOfWork() && nHeight > Params().GetConsensus().nLastPOWBlock)
         return state.DoS(10, false, REJECT_INVALID, "check-pow-height", "pow-mined blocks not allowed");
+
+    if (IsNtpSyncEnabled(pindexPrev,Params().GetConsensus()) && block.GetBlockTime() < pindexPrev->GetPastTimeLimit())
+        return state.Invalid(false, REJECT_INVALID, "too-old", "block goes too far in the past");
 
     // Check CheckCoinStakeTimestamp
     if (block.IsProofOfStake() && !CheckCoinStakeTimestamp(nHeight, block.GetBlockTime(), (int64_t)block.vtx[1].nTime))
@@ -6071,8 +6087,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
         }
 
-        pfrom->fSuccessfullyConnected = true;
-
         string remoteAddr;
         if (fLogIPs)
             remoteAddr = ", peeraddr=" + pfrom->addr.ToString();
@@ -6084,7 +6098,16 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         int64_t nTimeOffset = nTime - GetTime();
         pfrom->nTimeOffset = nTimeOffset;
-        AddTimeData(pfrom->addr, nTimeOffset);
+        if(IsNtpSyncEnabled(chainActive.Tip(), Params().GetConsensus()) && abs64(pfrom->nTimeOffset) > GetArg("-maxtimeoffset", MAXIMUM_TIME_OFFSET))
+        {
+            LogPrintf("peer=%d clock drifts too much (%d); disconnecting\n", pfrom->id, pfrom->nTimeOffset);
+            pfrom->PushMessage(NetMsgType::REJECT, strCommand, REJECT_INVALID,
+                               strprintf("Clock drift cannot be greater than %d. Please, adjust your clock.", GetArg("-maxtimeoffset", MAXIMUM_TIME_OFFSET)));
+            pfrom->fDisconnect = true;
+            return false;
+        }
+        pfrom->fSuccessfullyConnected = true;
+
     }
 
 
@@ -7868,7 +7891,7 @@ unsigned int ComputedMinStake(unsigned int nBase, int64_t nTime, unsigned int nB
 unsigned int GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfStake)
 {
 
-    CBigNum bnTargetLimit = CBigNum(ArithToUint256(fProofOfStake ? GetProofOfStakeLimit(pindexLast->nHeight) : Params().ProofOfWorkLimit()));
+    arith_uint256 bnTargetLimit = fProofOfStake ? GetProofOfStakeLimit(pindexLast->nHeight) : Params().ProofOfWorkLimit();
 
     if (pindexLast == NULL)
         return bnTargetLimit.GetCompact(); // genesis block
@@ -7889,10 +7912,10 @@ unsigned int GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfS
 
     // ppcoin: target change every block
     // ppcoin: retarget with exponential moving toward target spacing
-    CBigNum bnNew;
+    arith_uint256 bnNew;
     bnNew.SetCompact(pindexPrev->nBits);
 
-    CBigNum nInterval = (Params().GetConsensus().nTargetTimespan) / (Params().GetConsensus().nTargetSpacing);
+    arith_uint256 nInterval = (Params().GetConsensus().nTargetTimespan) / (Params().GetConsensus().nTargetSpacing);
     bnNew *= (((nInterval - 1)) * (Params().GetConsensus().nTargetSpacing) + (nActualSpacing) + (nActualSpacing));
     bnNew /= (((nInterval + 1)) * (Params().GetConsensus().nTargetSpacing));
 
@@ -7909,7 +7932,7 @@ arith_uint256 GetProofOfStakeLimit(int nHeight)
 
 bool TransactionGetCoinAge(CTransaction& transaction, uint64_t& nCoinAge)
 {
-    CBigNum bnCentSecond = 0;  // coin age in the unit of cent-seconds
+    arith_uint256 bnCentSecond = 0;  // coin age in the unit of cent-seconds
     nCoinAge = 0;
 
     if (transaction.IsCoinBase())
@@ -7936,16 +7959,16 @@ bool TransactionGetCoinAge(CTransaction& transaction, uint64_t& nCoinAge)
             continue; // only count coins meeting min age requirement
 
         int64_t nValueIn = txPrev.vout[txin.prevout.n].nValue;
-        bnCentSecond += CBigNum(nValueIn) * (transaction.nTime-txPrev.nTime) / CENT;
+        bnCentSecond += arith_uint256(nValueIn) * (transaction.nTime-txPrev.nTime) / CENT;
 
 
         LogPrint("coinage", "coin age nValueIn=%d nTimeDiff=%d bnCentSecond=%s\n", nValueIn, transaction.nTime - txPrev.nTime, bnCentSecond.ToString());
     }
 
 
-    CBigNum bnCoinDay = ((bnCentSecond * CENT) / COIN) / (24 * 60 * 60);
+    arith_uint256 bnCoinDay = ((bnCentSecond * CENT) / COIN) / (24 * 60 * 60);
     LogPrint("coinage", "coin age bnCoinDay=%s\n", bnCoinDay.ToString());
-    nCoinAge = bnCoinDay.getuint64();
+    nCoinAge = bnCoinDay.GetLow64();
 
     return true;
 }
@@ -8153,15 +8176,15 @@ static bool CheckStakeKernelHashV2(CBlockIndex* pindexPrev, unsigned int nBits, 
         return error("CheckStakeKernelHash() : min age violation");
 
     // Base target
-    CBigNum bnTarget;
-    bnTarget.SetCompact(nBits);
+    targetProofOfStake.SetCompact(nBits);
 
     // Weighted target
     int64_t nValueIn = txPrev.vout[prevout.n].nValue;
-    CBigNum bnWeight = CBigNum(nValueIn);
-    bnTarget *= bnWeight;
+    arith_uint512 bnWeight = arith_uint512(nValueIn);
 
-    targetProofOfStake = UintToArith256(bnTarget.getuint256());
+    // We need to convert to uint512 to prevent overflow when multiplying by 1st block coins
+    base_uint<512> targetProofOfStake512(targetProofOfStake.GetHex());
+    targetProofOfStake512 *= bnWeight;
 
     uint64_t nStakeModifier = pindexPrev->nStakeModifier;
     int nStakeModifierHeight = pindexPrev->nHeight;
@@ -8181,11 +8204,14 @@ static bool CheckStakeKernelHashV2(CBlockIndex* pindexPrev, unsigned int nBits, 
         LogPrint("stakemodifier","CheckStakeKernelHash() : check modifier=0x%016x nTimeBlockFrom=%u nTimeTxPrev=%u nPrevout=%u nTimeTx=%u hashProof=%s bnTarget=%s nBits=%08x nValueIn=%d bnWeight=%s\n",
             nStakeModifier,
             nTimeBlockFrom, txPrev.nTime, prevout.n, nTimeTx,
-            hashProofOfStake.ToString(),bnTarget.ToString(), nBits, nValueIn,bnWeight.ToString());
+            hashProofOfStake.ToString(), targetProofOfStake512.ToString(), nBits, nValueIn,bnWeight.ToString());
     }
 
+    // We need to convert type so it can be compared to target
+    base_uint<512> hashProofOfStake512(hashProofOfStake.GetHex());
+
     // Now check if proof-of-stake hash meets target protocol
-    if (CBigNum(ArithToUint256(hashProofOfStake)) > bnTarget)
+    if (hashProofOfStake512 > targetProofOfStake512)
       return false;
 
     if (fDebug && !fPrintProofOfStake)
@@ -8311,7 +8337,7 @@ int64_t GetProofOfStakeReward(int nHeight, int64_t nCoinAge, int64_t nFees, CBlo
         nRewardCoinYear = 0.5 * MAX_MINT_PROOF_OF_STAKE;
     else if(nHeight-1 < (730 * Params().GetConsensus().nDailyBlockCount))
         nRewardCoinYear = 0.5 * MAX_MINT_PROOF_OF_STAKE;
-    else if(IsCommunityFundEnabled(pindexPrev, Params().GetConsensus()))
+    else if(IsCommunityFundAccumulationEnabled(pindexPrev, Params().GetConsensus(), false))
         nRewardCoinYear = 0.4 * MAX_MINT_PROOF_OF_STAKE;
     else
         nRewardCoinYear = 0.5 * MAX_MINT_PROOF_OF_STAKE;
